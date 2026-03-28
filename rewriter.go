@@ -9,6 +9,9 @@ import (
 )
 
 func rewriteResponseHeaders(resp *http.Response, baseURL string) {
+	// Some customized Emby backends return absolute upstream URLs in headers and
+	// response bodies. Those paths are hard-coded by the backend and cannot be
+	// fixed there, so the proxy must rewrite them back to proxy URLs here.
 	if loc := resp.Header.Get("Location"); loc != "" {
 		resp.Header.Set("Location", rewriteSingleURL(loc, baseURL))
 	}
@@ -46,8 +49,10 @@ var httpScheme = []byte("http://")
 var httpsScheme = []byte("https://")
 
 // rewriteBody scans for all http:// and https:// URLs in the body and
-// rewrites them to proxy URLs. Uses bytes.Index for fast searching —
-// no regex, no url.Parse per match.
+// rewrites them to proxy URLs. This is required because the customized Emby
+// backend may emit absolute upstream URLs in JSON/HTML/XML payloads, and those
+// hard-coded paths cannot be corrected on the backend side.
+// Uses bytes.Index for fast searching — no regex, no url.Parse per match.
 func rewriteBody(body []byte, baseURL string) []byte {
 	// Fast check: if no "http" in body at all, skip entirely.
 	if !bytes.Contains(body, []byte("http")) {

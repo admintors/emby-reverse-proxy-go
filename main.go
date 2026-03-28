@@ -44,8 +44,8 @@ func main() {
 		IdleTimeout:       serverIdleTimeout,
 	}
 
-	log.Printf("emby-proxy listening on %s", addr)
+	log.Printf("[SERVER] listening on %s", addr)
 	if err := server.ListenAndServe(); err != nil {
-		log.Fatalf("server failed: %v", err)
+		log.Fatalf("[SERVER] fatal: %v", err)
 	}
 }

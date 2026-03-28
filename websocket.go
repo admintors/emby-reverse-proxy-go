@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -43,7 +45,7 @@ func (h *ProxyHandler) serveWebSocket(w http.ResponseWriter, r *http.Request, t 
 	_ = upstreamConn.SetDeadline(time.Now().Add(webSocketHandshakeTimeout))
 
 	if err := writeWebSocketRequest(upstreamConn, r, t); err != nil {
-		log.Printf("[ERROR] websocket request write %s/%s failed: %v", t.Domain, t.Path, err)
+		logExpectedDisconnect(err, "websocket request write %s/%s failed", t.Domain, t.Path)
 		writeHijackedHTTPError(clientRW, http.StatusBadGateway, "upstream websocket handshake failed")
 		return
 	}
@@ -51,39 +53,39 @@ func (h *ProxyHandler) serveWebSocket(w http.ResponseWriter, r *http.Request, t 
 	upstreamReader := bufio.NewReader(upstreamConn)
 	resp, err := http.ReadResponse(upstreamReader, r)
 	if err != nil {
-		log.Printf("[ERROR] websocket response read %s/%s failed: %v", t.Domain, t.Path, err)
+		logExpectedDisconnect(err, "websocket response read %s/%s failed", t.Domain, t.Path)
 		writeHijackedHTTPError(clientRW, http.StatusBadGateway, "invalid upstream websocket response")
 		return
 	}
 
 	statusLine := fmt.Sprintf("HTTP/1.1 %d %s\r\n", resp.StatusCode, http.StatusText(resp.StatusCode))
 	if _, err := clientRW.WriteString(statusLine); err != nil {
-		log.Printf("[ERROR] websocket response status write %s/%s failed: %v", t.Domain, t.Path, err)
+		logExpectedDisconnect(err, "websocket response status write %s/%s failed", t.Domain, t.Path)
 		resp.Body.Close()
 		return
 	}
 	if err := resp.Header.Write(clientRW); err != nil {
-		log.Printf("[ERROR] websocket response header write %s/%s failed: %v", t.Domain, t.Path, err)
+		logExpectedDisconnect(err, "websocket response header write %s/%s failed", t.Domain, t.Path)
 		resp.Body.Close()
 		return
 	}
 	if _, err := clientRW.WriteString("\r\n"); err != nil {
-		log.Printf("[ERROR] websocket response header terminator write %s/%s failed: %v", t.Domain, t.Path, err)
+		logExpectedDisconnect(err, "websocket response header terminator write %s/%s failed", t.Domain, t.Path)
 		resp.Body.Close()
 		return
 	}
 	if err := clientRW.Flush(); err != nil {
-		log.Printf("[ERROR] websocket client flush %s/%s failed: %v", t.Domain, t.Path, err)
+		logExpectedDisconnect(err, "websocket client flush %s/%s failed", t.Domain, t.Path)
 		resp.Body.Close()
 		return
 	}
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		if err := copyResponseBodyToHijackedClient(clientRW, resp.Body); err != nil {
-			log.Printf("[ERROR] websocket rejected response body write %s/%s failed: %v", t.Domain, t.Path, err)
+			logExpectedDisconnect(err, "websocket rejected response body write %s/%s failed", t.Domain, t.Path)
 		}
 		resp.Body.Close()
-		log.Printf("[PROXY] %d %s %s/%s | websocket upgrade rejected | %s",
+		log.Printf("[PROXY] %d %s %s/%s | upgrade rejected | %s",
 			resp.StatusCode, r.Method, t.Domain, t.Path, time.Since(start))
 		return
 	}
@@ -91,18 +93,18 @@ func (h *ProxyHandler) serveWebSocket(w http.ResponseWriter, r *http.Request, t 
 
 	clientBuffered, err := drainBufferedReader(clientRW.Reader, upstreamConn)
 	if err != nil {
-		log.Printf("[ERROR] websocket buffered client drain %s/%s failed: %v", t.Domain, t.Path, err)
+		logExpectedDisconnect(err, "websocket buffered client drain %s/%s failed", t.Domain, t.Path)
 		return
 	}
 	upstreamBuffered, err := drainBufferedReader(upstreamReader, clientConn)
 	if err != nil {
-		log.Printf("[ERROR] websocket buffered upstream drain %s/%s failed: %v", t.Domain, t.Path, err)
+		logExpectedDisconnect(err, "websocket buffered upstream drain %s/%s failed", t.Domain, t.Path)
 		return
 	}
 
 	_ = clientConn.SetDeadline(time.Time{})
 	_ = upstreamConn.SetDeadline(time.Time{})
-	bytesUp, bytesDown := proxyWebSocketStreams(clientConn, upstreamConn)
+	bytesUp, bytesDown := proxyWebSocketStreams(clientConn, upstreamConn, t)
 	bytesUp += clientBuffered
 	bytesDown += upstreamBuffered
 	log.Printf("[WS] %d %s %s/%s | up %s | down %s | %s",
@@ -139,7 +141,7 @@ func writeWebSocketRequest(conn net.Conn, r *http.Request, t *target) error {
 	return req.Write(conn)
 }
 
-func proxyWebSocketStreams(clientConn, upstreamConn net.Conn) (int64, int64) {
+func proxyWebSocketStreams(clientConn, upstreamConn net.Conn, t *target) (int64, int64) {
 	var wg sync.WaitGroup
 	var upstreamBytes int64
 	var downstreamBytes int64
@@ -151,8 +153,8 @@ func proxyWebSocketStreams(clientConn, upstreamConn net.Conn) (int64, int64) {
 		defer copyBufPool.Put(bufp)
 		written, err := io.CopyBuffer(upstreamConn, clientConn, *bufp)
 		upstreamBytes = written
-		if err != nil && !isNetClosedError(err) {
-			log.Printf("[ERROR] websocket upstream copy failed: %v", err)
+		if err != nil {
+			logExpectedDisconnect(err, "websocket upstream copy %s/%s failed", t.Domain, t.Path)
 		}
 		_ = upstreamConn.SetReadDeadline(time.Now())
 	}()
@@ -162,8 +164,8 @@ func proxyWebSocketStreams(clientConn, upstreamConn net.Conn) (int64, int64) {
 		defer copyBufPool.Put(bufp)
 		written, err := io.CopyBuffer(clientConn, upstreamConn, *bufp)
 		downstreamBytes = written
-		if err != nil && !isNetClosedError(err) {
-			log.Printf("[ERROR] websocket downstream copy failed: %v", err)
+		if err != nil {
+			logExpectedDisconnect(err, "websocket downstream copy %s/%s failed", t.Domain, t.Path)
 		}
 		_ = clientConn.SetReadDeadline(time.Now())
 	}()
@@ -210,9 +212,21 @@ func writeHijackedHTTPError(rw *bufio.ReadWriter, statusCode int, message string
 	_ = rw.Flush()
 }
 
-func isNetClosedError(err error) bool {
+func logExpectedDisconnect(err error, format string, args ...any) {
+	allArgs := append(args, err)
+	if isExpectedDisconnect(err) {
+		log.Printf("[WARN] "+format+": %v", allArgs...)
+		return
+	}
+	log.Printf("[ERROR] "+format+": %v", allArgs...)
+}
+
+func isExpectedDisconnect(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+		return true
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "use of closed network connection") || strings.Contains(msg, "closed pipe") || strings.Contains(msg, "broken pipe") || strings.Contains(msg, "connection reset by peer") || strings.Contains(msg, "eof")

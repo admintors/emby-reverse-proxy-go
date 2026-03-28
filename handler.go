@@ -112,7 +112,7 @@ func (h *ProxyHandler) serveHTTPProxy(w http.ResponseWriter, r *http.Request, t 
 
 	resp, err := h.client.Do(outReq)
 	if err != nil {
-		log.Printf("[ERROR] %s %s/%s : %v", r.Method, t.Domain, t.Path, err)
+		log.Printf("[ERROR] %s %s/%s upstream request failed: %v", r.Method, t.Domain, t.Path, err)
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
 	}
@@ -124,28 +124,28 @@ func (h *ProxyHandler) serveHTTPProxy(w http.ResponseWriter, r *http.Request, t 
 	ct := resp.Header.Get("Content-Type")
 	contentEncoding := normalizeContentEncoding(resp.Header.Get("Content-Encoding"))
 	if shouldRewriteBody(ct) && safeContentEncodings[contentEncoding] {
-		h.serveRewrittenBody(w, r, resp, baseURL)
-		log.Printf("[API] %d %s %s/%s (%s)", resp.StatusCode, r.Method, t.Domain, t.Path, time.Since(start))
+		h.serveRewrittenBody(w, r, resp, t, baseURL)
+		log.Printf("[API] %d %s %s/%s | rewritten | %s", resp.StatusCode, r.Method, t.Domain, t.Path, time.Since(start))
 		return
 	}
 
-	written := h.serveStreamBody(w, resp)
+	written := h.serveStreamBody(w, resp, t)
 	elapsed := time.Since(start)
 	if media {
-		log.Printf("[STREAM] %d %s %s/%s | %s | %s",
+		log.Printf("[STREAM] %d %s %s/%s | bytes %s | %s",
 			resp.StatusCode, r.Method, t.Domain, t.Path,
 			formatBytes(written), elapsed)
 		return
 	}
-	log.Printf("[PROXY] %d %s %s/%s | %s | %s",
+	log.Printf("[PROXY] %d %s %s/%s | bytes %s | %s",
 		resp.StatusCode, r.Method, t.Domain, t.Path,
 		formatBytes(written), elapsed)
 }
 
-func (h *ProxyHandler) serveRewrittenBody(w http.ResponseWriter, r *http.Request, resp *http.Response, baseURL string) {
+func (h *ProxyHandler) serveRewrittenBody(w http.ResponseWriter, r *http.Request, resp *http.Response, t *target, baseURL string) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("[ERROR] read body failed: %v", err)
+		log.Printf("[ERROR] %s %s/%s read rewritten body failed: %v", r.Method, t.Domain, t.Path, err)
 		w.WriteHeader(http.StatusBadGateway)
 		return
 	}
@@ -163,30 +163,30 @@ func (h *ProxyHandler) serveRewrittenBody(w http.ResponseWriter, r *http.Request
 		closeErr := gz.Close()
 		gzipWriterPool.Put(gz)
 		if writeErr != nil {
-			log.Printf("[ERROR] write gzipped response failed: %v", writeErr)
+			logExpectedDisconnect(writeErr, "%s %s/%s write gzipped response failed", r.Method, t.Domain, t.Path)
 		}
 		if closeErr != nil {
-			log.Printf("[ERROR] close gzip writer failed: %v", closeErr)
+			logExpectedDisconnect(closeErr, "%s %s/%s close gzip writer failed", r.Method, t.Domain, t.Path)
 		}
 	} else {
 		w.Header().Set("Content-Length", strconv.Itoa(len(rewritten)))
 		w.Header().Del("Content-Encoding")
 		w.WriteHeader(resp.StatusCode)
 		if _, err := w.Write(rewritten); err != nil {
-			log.Printf("[ERROR] write rewritten response failed: %v", err)
+			logExpectedDisconnect(err, "%s %s/%s write rewritten response failed", r.Method, t.Domain, t.Path)
 		}
 	}
 }
 
 // serveStreamBody pipes upstream to client via io.CopyBuffer with pooled buffer.
 // No intermediate buffering — on Linux this can trigger splice(2).
-func (h *ProxyHandler) serveStreamBody(w http.ResponseWriter, resp *http.Response) int64 {
+func (h *ProxyHandler) serveStreamBody(w http.ResponseWriter, resp *http.Response, t *target) int64 {
 	w.WriteHeader(resp.StatusCode)
 	bufp := copyBufPool.Get().(*[]byte)
 	written, err := io.CopyBuffer(w, resp.Body, *bufp)
 	copyBufPool.Put(bufp)
-	if err != nil && !isNetClosedError(err) {
-		log.Printf("[ERROR] stream copy failed: %v", err)
+	if err != nil {
+		logExpectedDisconnect(err, "%s/%s stream copy failed", t.Domain, t.Path)
 	}
 	return written
 }
