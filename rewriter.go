@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -28,9 +29,13 @@ var rewritableTypes = []string{
 }
 
 func shouldRewriteBody(contentType string) bool {
-	ct := strings.ToLower(contentType)
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		mediaType = contentType
+	}
+	ct := strings.ToLower(strings.TrimSpace(mediaType))
 	for _, t := range rewritableTypes {
-		if strings.Contains(ct, t) {
+		if ct == t {
 			return true
 		}
 	}

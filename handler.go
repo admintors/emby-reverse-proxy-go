@@ -8,7 +8,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,14 +34,6 @@ var gzipWriterPool = sync.Pool{
 
 type ProxyHandler struct {
 	client *http.Client
-}
-
-type target struct {
-	Scheme string
-	Domain string
-	Port   int
-	Path   string
-	Query  string
 }
 
 func NewProxyHandler() *ProxyHandler {
@@ -80,35 +71,6 @@ func NewProxyHandler() *ProxyHandler {
 	}
 }
 
-var hopByHopHeaders = map[string]bool{
-	"Connection":          true,
-	"Keep-Alive":          true,
-	"Proxy-Authenticate":  true,
-	"Proxy-Authorization": true,
-	"Proxy-Connection":    true,
-	"Te":                  true,
-	"Trailer":             true,
-	"Transfer-Encoding":   true,
-	"Upgrade":             true,
-}
-
-var stripRequestHeaders = []string{
-	"X-Real-Ip",
-	"X-Forwarded-For",
-	"X-Forwarded-Proto",
-	"X-Forwarded-Host",
-	"X-Forwarded-Port",
-	"Forwarded",
-	"Via",
-}
-
-var stripResponseHeaders = []string{
-	"Server",
-	"X-Powered-By",
-	"X-Frame-Options",
-	"X-Content-Type-Options",
-}
-
 func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	t, err := parseTarget(r.URL.Path, r.URL.RawQuery)
 	if err != nil {
@@ -117,53 +79,33 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
+	if isWebSocketRequest(r) {
+		h.serveWebSocket(w, r, t, start)
+		return
+	}
+
+	h.serveHTTPProxy(w, r, t, start)
+}
+
+func (h *ProxyHandler) serveHTTPProxy(w http.ResponseWriter, r *http.Request, t *target, start time.Time) {
 	baseURL := inferBaseURL(r)
-	targetURL := buildTargetURL(t)
 	media := looksLikeMedia(t.Path)
 
-	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
+	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, buildTargetURL(t), r.Body)
 	if err != nil {
 		http.Error(w, "failed to create request", http.StatusInternalServerError)
 		return
 	}
 
-	// Copy headers, skip hop-by-hop
-	for k, vs := range r.Header {
-		if hopByHopHeaders[k] {
-			continue
-		}
-		outReq.Header[k] = vs
-	}
-
-	// Passthrough Range / If-Range for video seek & resume.
-	// Without this, a seek request pulls the entire file from upstream.
+	copyRequestHeaders(outReq.Header, r.Header, false)
 	if rng := r.Header.Get("Range"); rng != "" {
 		outReq.Header.Set("Range", rng)
 	}
 	if ifr := r.Header.Get("If-Range"); ifr != "" {
 		outReq.Header.Set("If-Range", ifr)
 	}
-
-	// Masquerade Host + TLS SNI
-	hostVal := t.Domain
-	if !isDefaultPort(t.Scheme, t.Port) {
-		hostVal = net.JoinHostPort(t.Domain, strconv.Itoa(t.Port))
-	}
-	outReq.Host = hostVal
-	outReq.Header.Set("Host", hostVal)
-
-	for _, name := range stripRequestHeaders {
-		outReq.Header.Del(name)
-	}
-
-	// Rewrite Referer & Origin to bypass hotlink protection
-	if ref := outReq.Header.Get("Referer"); ref != "" {
-		outReq.Header.Set("Referer", unproxyURL(ref))
-	}
-	if origin := outReq.Header.Get("Origin"); origin != "" {
-		outReq.Header.Set("Origin", unproxyURL(origin))
-	}
-
+	setUpstreamHost(outReq, t)
+	rewriteProxySensitiveRequestHeaders(outReq.Header)
 	if !media {
 		outReq.Header.Set("Accept-Encoding", "identity")
 	}
@@ -177,36 +119,27 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	rewriteResponseHeaders(resp, baseURL)
-
-	// Copy response headers, skip hop-by-hop, strip revealing ones
-	outHeader := w.Header()
-	for k, vs := range resp.Header {
-		if hopByHopHeaders[k] {
-			continue
-		}
-		outHeader[k] = vs
-	}
-	for _, name := range stripResponseHeaders {
-		outHeader.Del(name)
-	}
+	copyResponseHeaders(w.Header(), resp.Header)
 
 	ct := resp.Header.Get("Content-Type")
-	if shouldRewriteBody(ct) {
+	contentEncoding := normalizeContentEncoding(resp.Header.Get("Content-Encoding"))
+	if shouldRewriteBody(ct) && safeContentEncodings[contentEncoding] {
 		h.serveRewrittenBody(w, r, resp, baseURL)
 		log.Printf("[API] %d %s %s/%s (%s)", resp.StatusCode, r.Method, t.Domain, t.Path, time.Since(start))
-	} else {
-		written := h.serveStreamBody(w, resp)
-		elapsed := time.Since(start)
-		if media {
-			log.Printf("[STREAM] %d %s %s/%s | %s | %s",
-				resp.StatusCode, r.Method, t.Domain, t.Path,
-				formatBytes(written), elapsed)
-		} else {
-			log.Printf("[PROXY] %d %s %s/%s | %s | %s",
-				resp.StatusCode, r.Method, t.Domain, t.Path,
-				formatBytes(written), elapsed)
-		}
+		return
 	}
+
+	written := h.serveStreamBody(w, resp)
+	elapsed := time.Since(start)
+	if media {
+		log.Printf("[STREAM] %d %s %s/%s | %s | %s",
+			resp.StatusCode, r.Method, t.Domain, t.Path,
+			formatBytes(written), elapsed)
+		return
+	}
+	log.Printf("[PROXY] %d %s %s/%s | %s | %s",
+		resp.StatusCode, r.Method, t.Domain, t.Path,
+		formatBytes(written), elapsed)
 }
 
 func (h *ProxyHandler) serveRewrittenBody(w http.ResponseWriter, r *http.Request, resp *http.Response, baseURL string) {
@@ -226,14 +159,22 @@ func (h *ProxyHandler) serveRewrittenBody(w http.ResponseWriter, r *http.Request
 
 		gz := gzipWriterPool.Get().(*gzip.Writer)
 		gz.Reset(w)
-		gz.Write(rewritten)
-		gz.Close()
+		_, writeErr := gz.Write(rewritten)
+		closeErr := gz.Close()
 		gzipWriterPool.Put(gz)
+		if writeErr != nil {
+			log.Printf("[ERROR] write gzipped response failed: %v", writeErr)
+		}
+		if closeErr != nil {
+			log.Printf("[ERROR] close gzip writer failed: %v", closeErr)
+		}
 	} else {
 		w.Header().Set("Content-Length", strconv.Itoa(len(rewritten)))
 		w.Header().Del("Content-Encoding")
 		w.WriteHeader(resp.StatusCode)
-		w.Write(rewritten)
+		if _, err := w.Write(rewritten); err != nil {
+			log.Printf("[ERROR] write rewritten response failed: %v", err)
+		}
 	}
 }
 
@@ -242,8 +183,11 @@ func (h *ProxyHandler) serveRewrittenBody(w http.ResponseWriter, r *http.Request
 func (h *ProxyHandler) serveStreamBody(w http.ResponseWriter, resp *http.Response) int64 {
 	w.WriteHeader(resp.StatusCode)
 	bufp := copyBufPool.Get().(*[]byte)
-	written, _ := io.CopyBuffer(w, resp.Body, *bufp)
+	written, err := io.CopyBuffer(w, resp.Body, *bufp)
 	copyBufPool.Put(bufp)
+	if err != nil {
+		log.Printf("[ERROR] stream copy failed: %v", err)
+	}
 	return written
 }
 
@@ -289,91 +233,4 @@ func looksLikeMedia(path string) bool {
 		return mediaExtensions[ext]
 	}
 	return false
-}
-
-func parseTarget(path, query string) (*target, error) {
-	trimmed := strings.TrimPrefix(path, "/")
-	if trimmed == "" {
-		return nil, fmt.Errorf("usage: /{scheme}/{domain}/{port}/{path}")
-	}
-	parts := strings.SplitN(trimmed, "/", 4)
-	if len(parts) < 3 {
-		return nil, fmt.Errorf("usage: /{scheme}/{domain}/{port}/{path}")
-	}
-	scheme := strings.ToLower(parts[0])
-	if scheme != "http" && scheme != "https" {
-		return nil, fmt.Errorf("scheme must be http or https, got: %s", scheme)
-	}
-	domain := parts[1]
-	if domain == "" {
-		return nil, fmt.Errorf("domain is required")
-	}
-	port, err := strconv.Atoi(parts[2])
-	if err != nil || port < 1 || port > 65535 {
-		return nil, fmt.Errorf("invalid port: %s", parts[2])
-	}
-	remaining := ""
-	if len(parts) == 4 {
-		remaining = parts[3]
-	}
-	return &target{Scheme: scheme, Domain: domain, Port: port, Path: remaining, Query: query}, nil
-}
-
-func buildTargetURL(t *target) string {
-	var b strings.Builder
-	b.Grow(len(t.Scheme) + 3 + len(t.Domain) + 6 + 1 + len(t.Path) + 1 + len(t.Query))
-	b.WriteString(t.Scheme)
-	b.WriteString("://")
-	b.WriteString(t.Domain)
-	b.WriteByte(':')
-	b.WriteString(strconv.Itoa(t.Port))
-	b.WriteByte('/')
-	b.WriteString(t.Path)
-	if t.Query != "" {
-		b.WriteByte('?')
-		b.WriteString(t.Query)
-	}
-	return b.String()
-}
-
-func inferBaseURL(r *http.Request) string {
-	scheme := "http"
-	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
-		scheme = proto
-	}
-	host := r.Header.Get("X-Forwarded-Host")
-	if host == "" {
-		host = r.Host
-	}
-	return scheme + "://" + host
-}
-
-func isDefaultPort(scheme string, port int) bool {
-	return (scheme == "https" && port == 443) || (scheme == "http" && port == 80)
-}
-
-func unproxyURL(raw string) string {
-	parsed, err := url.Parse(raw)
-	if err != nil {
-		return raw
-	}
-	t, err := parseTarget(parsed.Path, "")
-	if err != nil {
-		return raw
-	}
-	var b strings.Builder
-	b.WriteString(t.Scheme)
-	b.WriteString("://")
-	b.WriteString(t.Domain)
-	if !isDefaultPort(t.Scheme, t.Port) {
-		b.WriteByte(':')
-		b.WriteString(strconv.Itoa(t.Port))
-	}
-	if t.Path != "" {
-		b.WriteByte('/')
-		b.WriteString(t.Path)
-	} else {
-		b.WriteByte('/')
-	}
-	return b.String()
 }

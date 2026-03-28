@@ -4,6 +4,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
+)
+
+const (
+	serverReadHeaderTimeout = 10 * time.Second
+	serverReadTimeout       = 30 * time.Second
+	serverWriteTimeout      = 0
+	serverIdleTimeout       = 120 * time.Second
 )
 
 func main() {
@@ -19,14 +27,25 @@ func main() {
 	// Health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		if _, err := w.Write([]byte("ok")); err != nil {
+			log.Printf("[ERROR] write /health response failed: %v", err)
+		}
 	})
 
 	// All other routes go to proxy handler
 	mux.Handle("/", handler)
 
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadTimeout:       serverReadTimeout,
+		WriteTimeout:      serverWriteTimeout,
+		IdleTimeout:       serverIdleTimeout,
+	}
+
 	log.Printf("emby-proxy listening on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("server failed: %v", err)
 	}
 }
